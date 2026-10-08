@@ -352,7 +352,8 @@ fm_composer_strip_ghost() {
 # asking what a worker is doing, and the two must not be conflated.
 # Delivery-only rendered busy footers per harness. claude/codex: "esc to
 # interrupt"; opencode: "esc interrupt"; pi: "Working..."; omp: "Working…"; grok: "Ctrl+c:cancel"; agy: "esc to cancel";
-# devin: "esc twice to interrupt" and its "❭ Guide Devin while it works" working composer.
+# devin: "esc twice to interrupt" and its "❭ Guide Devin while it works" working composer;
+# kiro: its "› Kiro is working" composer row and "Thinking... (esc to cancel)" row.
 # Claude's current spinner has a rotating glyph and word, but every active-turn
 # line has an ellipsis followed by a parenthesized elapsed duration. Keep this
 # signature separate from the shared default because that shape is not generic
@@ -377,11 +378,19 @@ fm_composer_strip_ghost() {
 # tmux agy endpoint reaches the submit core with no recorded harness, and its
 # bare `>` composer verdict is `unknown`, so the busy footer is the only
 # turn-started acknowledgement that path can read.
-FM_DELIVERY_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working(\.\.\.|…)|Ctrl\+c:cancel|ctrl\+c to stop|esc[[:space:]]+to[[:space:]]+cancel|esc twice to interrupt|^[[:space:]]*❭ Guide Devin while it works$'
+FM_DELIVERY_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working(\.\.\.|…)|Ctrl\+c:cancel|ctrl\+c to stop|esc[[:space:]]+to[[:space:]]+cancel|esc twice to interrupt|^[[:space:]]*❭ Guide Devin while it works$|^[[:space:]]*›[[:space:]]+Kiro is working'
 FM_DELIVERY_CLAUDE_BUSY_REGEX_DEFAULT='esc to interrupt|…[[:space:]]+\([0-9]+[smh]'
 # Devin 3000.11.1: the working composer and interrupt hint are independent
 # delivery signals. Neither is used as semantic worker-state evidence.
 FM_DELIVERY_DEVIN_BUSY_REGEX_DEFAULT='esc twice to interrupt|^[[:space:]]*❭ Guide Devin while it works$'
+# kiro-cli 2.27.1 replaces its composer row with `›  Kiro is working · <n>s ·
+# Type to steer` for the whole turn and renders `Thinking... (esc to cancel)`
+# above it while the model reasons; both are independent delivery signals.
+# The bare `esc to cancel` token is deliberately not used for kiro: its slash
+# popup footer (`esc to cancel · ↵ to select`) renders it on an idle agent.
+# Recorded worker state comes from the kiro-turn-marker source in
+# bin/fm-busy-lib.sh, never from these rows.
+FM_DELIVERY_KIRO_BUSY_REGEX_DEFAULT='^[[:space:]]*›[[:space:]]+Kiro is working|Thinking\.\.\.[[:space:]]+\(esc to cancel\)'
 FM_DELIVERY_CODEX_BUSY_REGEX_DEFAULT='esc to interrupt'
 FM_DELIVERY_OPENCODE_BUSY_REGEX_DEFAULT='esc interrupt'
 FM_DELIVERY_PI_BUSY_REGEX_DEFAULT='Working\.\.\.'
@@ -430,6 +439,7 @@ fm_busy_lines_match() {  # [harness]
     case "$harness" in
       claude) regex=$FM_DELIVERY_CLAUDE_BUSY_REGEX_DEFAULT ;;
       devin) regex=$FM_DELIVERY_DEVIN_BUSY_REGEX_DEFAULT ;;
+      kiro) regex=$FM_DELIVERY_KIRO_BUSY_REGEX_DEFAULT ;;
       codex) regex=$FM_DELIVERY_CODEX_BUSY_REGEX_DEFAULT ;;
       opencode) regex=$FM_DELIVERY_OPENCODE_BUSY_REGEX_DEFAULT ;;
       pi|pi-signed) regex=$FM_DELIVERY_PI_BUSY_REGEX_DEFAULT ;;
@@ -470,6 +480,18 @@ FM_COMPOSER_SHELL_PROMPT_GLYPHS=$(printf '%s\n' '>' '$' '%' '#')
 # live, devin 3000.11.1). FM_COMPOSER_IDLE_RE overrides for an unverified harness;
 # matching is case-insensitive.
 FM_COMPOSER_IDLE_RE_DEFAULT='^Type a message\.\.\.$|^Ask anything(\.\.\.|…)|^Plan, search, build anything$|^Add a follow-up$|^Ask Devin to build features, fix bugs, or work on your code$'
+
+# Rendered-only composer text: a harness's own status line drawn INSIDE an
+# empty composer in a normal-luminance colour, so ghost stripping keeps it and
+# the idle set above would read it as typed (a styled read treats surviving
+# placeholder text as input). Each entry is anchored and carries furniture no
+# one types, so a match reads `empty` whatever the styling. Kiro draws all three
+# after its `›` glyph in gray truecolor 158;158;158 (verified live, kiro-cli
+# 2.27.1): `ask a question or describe a task ↵` when idle, `Initializing ·
+# type to queue a message` at startup, and `Kiro is working · <elapsed> · Type
+# to steer · ...` for a running turn; typed text replaces each one.
+# FM_COMPOSER_RENDERED_ONLY_RE overrides; matching is case-sensitive.
+FM_COMPOSER_RENDERED_ONLY_RE_DEFAULT='^ask a question or describe a task ↵$|^Initializing · type to queue a message$|^Kiro is working · [0-9][0-9hms ]* · Type to steer'
 
 # Opencode draws a mode/model footer line INSIDE its left-bar composer
 # ("Build · GPT-5.5 Fast OpenAI · high"). It is composer furniture, not typed
@@ -686,6 +708,9 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
   fi
   fm_composer_normalize_trim_var content
   [ -n "$content" ] || { printf 'empty'; return 0; }
+  if fm_composer_idle_matches "$content" "${FM_COMPOSER_RENDERED_ONLY_RE-$FM_COMPOSER_RENDERED_ONLY_RE_DEFAULT}" sensitive; then
+    printf 'empty'; return 0
+  fi
   fm_composer_idle_matches "$content" "$idle_re" "$idle_case" && idle_collision=1
   # Ghost stripping can leave a REMNANT of an idle placeholder rather than
   # emptying it, because a terminal draws the cell under its cursor in reverse
@@ -1233,6 +1258,17 @@ _fm_composer_row_is_omp_status() {  # <trimmed-row>
   fm_composer_idle_matches "$1" "${FM_COMPOSER_OMP_STATUS_RE:-$FM_COMPOSER_OMP_STATUS_RE_DEFAULT}" sensitive
 }
 
+# _fm_composer_row_is_hint_row: 0 when the trimmed row is a harness's own
+# keyboard-hint row drawn below a bare composer - furniture that bounds the
+# wrap region like omp's status row. Anchored whole-row entries only: Kiro's
+# right-aligned `/copy to clipboard` (verified live, kiro-cli 2.27.1), which a
+# cursorless read otherwise folds into the composer as wrapped input.
+# FM_COMPOSER_HINT_ROW_RE overrides.
+FM_COMPOSER_HINT_ROW_RE_DEFAULT='^/copy to clipboard$'
+_fm_composer_row_is_hint_row() {  # <trimmed-row>
+  fm_composer_idle_matches "$1" "${FM_COMPOSER_HINT_ROW_RE-$FM_COMPOSER_HINT_ROW_RE_DEFAULT}" sensitive
+}
+
 # _fm_composer_row_is_pi_status: 0 when the trimmed row is Pi's dollar-first
 # footer stats row (FM_COMPOSER_PI_STATUS_RE_DEFAULT above). Furniture below
 # the separated pair; a `$` cost cell must not count as a dead-shell prompt.
@@ -1283,6 +1319,7 @@ _fm_composer_wrap_region_ok() {  # <plain-screen> <glyph-row> <cursor-row>
     [ -n "$trimmed" ] || return 1
     if fm_composer_row_has_edge "$trimmed"; then return 1; fi
     if _fm_composer_row_is_omp_status "$trimmed"; then return 1; fi
+    if _fm_composer_row_is_hint_row "$trimmed"; then return 1; fi
     if _fm_composer_row_is_braille_furniture "$trimmed"; then return 1; fi
     if fm_composer_leading_shell_glyph_var glyph "$trimmed"; then return 1; fi
     row=$((row + 1))
@@ -1388,6 +1425,7 @@ _fm_composer_row_is_composer_furniture() {  # <trimmed-row> <proof-glyph>
   local row=$1 proof=$2 glyph=''
   [ -n "$row" ] || return 1
   _fm_composer_row_is_omp_status "$row" && return 0
+  _fm_composer_row_is_hint_row "$row" && return 0
   _fm_composer_row_is_braille_furniture "$row" && return 0
   fm_composer_idle_matches "$row" \
     "${FM_COMPOSER_MODE_HINT_RE:-$FM_COMPOSER_MODE_HINT_RE_DEFAULT}" sensitive && return 0
@@ -1558,6 +1596,7 @@ _fm_composer_select_cursorless() {
       [ -n "$trimmed" ] || break
       fm_composer_row_has_edge "$trimmed" && break
       _fm_composer_row_is_omp_status "$trimmed" && break
+      _fm_composer_row_is_hint_row "$trimmed" && break
       _fm_composer_row_is_braille_furniture "$trimmed" && break
       FM_COMPOSER_SELECTED_LAST=$next
       next=$((next + 1))

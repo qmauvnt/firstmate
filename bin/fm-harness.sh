@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Detect the agent harness this process tree runs on.
-# Usage: fm-harness.sh                  print own harness: claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|devin|unknown
+# Usage: fm-harness.sh                  print own harness: claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|devin|kiro|unknown
 #        fm-harness.sh crew             print the effective CREWMATE harness
 #                                        (config/crew-harness; "default" resolves to own)
 #        fm-harness.sh secondmate       print the harness the PRIMARY uses to launch
@@ -112,6 +112,13 @@ harness_marker() {
   # additionally clears foreign markers at rovo's launch boundary as defense in depth.
   [ "${ATLASSIAN_AGENT_TYPE:-}" = "rovo" ] && { echo rovo; return; }
   [ "${ROVODEV_CLI:-}" = "1" ] && { echo rovo; return; }
+  # kiro (Kiro CLI) sets KIRO_VERSION=<version> and KIRO_SESSION_ID on its tool
+  # subprocesses (verified, kiro-cli 2.27.1). It does NOT scrub an inherited
+  # CLAUDECODE either: a kiro pane started from a claude session reported both
+  # KIRO_VERSION and CLAUDECODE=1 to its own shell tool, so this is tested BEFORE
+  # the CLAUDECODE line for the same ordering hazard as cursor and rovo, and
+  # bin/fm-spawn.sh clears foreign markers at kiro's launch boundary as well.
+  [ -n "${KIRO_VERSION:-}" ] && { echo kiro; return; }
   # omp (Oh My Pi) publishes NO harness-identity marker of its own: verified on
   # omp 18.1.11 that PI_CODING_AGENT is absent from the binary and that the
   # default profile sets neither PI_CODING_AGENT_DIR nor OMP_PROFILE in the
@@ -239,6 +246,14 @@ harness_process_verdict() {  # <pid>
     # detected by ancestry alone.
     agy) echo "comm agy"; return ;;
     devin) echo "comm devin"; return ;;
+    # kiro's launcher `kiro-cli` execs `kiro-cli-chat`, which runs a Bun child
+    # (.../kiro-cli/bun) that in turn runs a second `kiro-cli-chat`; tool
+    # subprocesses hang off that inner process (verified, kiro-cli 2.27.1:
+    # `ps -o comm=` reports both names, as an install path on macOS).
+    # Anchored, never *kiro*, so the Kiro desktop app (`kiro`, `Kiro Helper`) and
+    # its `zsh (kiro-cli-term)` integration shells are not misread as this CLI,
+    # and no bare `bun` arm exists because unrelated Bun programs share it.
+    kiro-cli|kiro-cli-chat) echo "comm kiro"; return ;;
     node*|python*)
       # Bare interpreter: match the harness name in its script path.
       args=$(ps -o args= -p "$pid" 2>/dev/null)

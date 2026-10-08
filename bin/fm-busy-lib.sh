@@ -46,7 +46,7 @@
 #   fm-recovery      a documented recovery reset after relaunch
 # Classifier-only sources (never written into a record):
 #   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
-#   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
+#   cursor-transcript, kiro-turn-marker, missing, malformed, gen-mismatch, source-mismatch,
 #   kimi-unverified, codex-unverified, capture-failed, no-target, launch-prompt
 #
 # Classification (fm_busy_classify): busy | idle | unknown | dead, always
@@ -114,6 +114,11 @@
 # no writer, no arm, and no gen, so nothing is seeded that could never be
 # cleared. See fm_busy_cursor_turn_state for the fold. Cursor's rendered
 # `ctrl+c to stop` footer is deliberately not a state source here.
+#
+# The kiro pull source has no writer either: Kiro's own per-turn marker files,
+# bound to the task by the marker process's working directory, prove busy, and
+# idle additionally needs Kiro's empty composer placeholder on screen. See
+# "kiro turn-marker busy source" below.
 #
 # Codex negotiation (fm_busy_codex_appserver_observable,
 # fm_busy_codex_hooks_verified): the approved contract prefers Codex's
@@ -901,6 +906,106 @@ fm_busy_agy_tail_busy() {
     | grep -qiE 'esc[[:space:]]+to[[:space:]]+cancel'
 }
 
+# kiro turn-marker busy source
+#
+# Kiro CLI writes one JSON file per running turn into its turn-marker directory
+# and deletes it when the turn ends, including a Ctrl-C cancellation (verified
+# live on kiro-cli 2.27.1, macOS). The file is named <pid>-<turn-start-ms>.json,
+# where <pid> is the Bun engine process of the owning session, and holds
+# {"pid","turn_started_at_ms","last_alive_at_ms",...}. The directory is shared by
+# every Kiro session on the host, KIRO_TURN_MARKER_DIR is exported to Kiro's
+# children but not honored as an input, and last_alive_at_ms did not advance
+# during a 24-second turn, so neither the directory nor the heartbeat can be
+# per-task. The marker is bound to this task instead by its process: the Bun
+# engine runs with the launch directory as its working directory for the whole
+# session (shell tools run in subprocesses), so a live marker process whose cwd
+# is this task's worktree is positive proof of a turn in flight there.
+# Nothing is installed, armed, or seeded: like cursor's transcript this is a
+# pull source with no writer, so no record can be stranded.
+#
+# A marker's absence alone is not idle: before the brief's first turn starts the
+# pane renders `Initializing` with no marker, and an unreadable directory is
+# indistinguishable from an empty one. Idle therefore also requires the live
+# composer row - the last `›` row on screen - to be Kiro's empty placeholder.
+# Anything else is unknown.
+
+# fm_busy_kiro_marker_dir: the platform turn-marker directory. macOS is the
+# verified path; the XDG data path is Kiro's documented Linux data home and is
+# unverified, so an absent directory classifies unknown rather than idle.
+# FM_KIRO_TURN_MARKER_DIR overrides it (tests, nonstandard installs).
+fm_busy_kiro_marker_dir() {
+  if [ -n "${FM_KIRO_TURN_MARKER_DIR:-}" ]; then
+    printf '%s' "$FM_KIRO_TURN_MARKER_DIR"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s' "${HOME:-}/Library/Application Support/kiro-cli/run/turn-markers" ;;
+    *) printf '%s' "${XDG_DATA_HOME:-${HOME:-}/.local/share}/kiro-cli/run/turn-markers" ;;
+  esac
+}
+
+# fm_busy_pid_cwd: the working directory of a live process owned by any user we
+# can inspect, or failure. /proc on Linux; lsof elsewhere (macOS has no /proc).
+fm_busy_pid_cwd() {  # <pid>
+  local pid=$1 cwd
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -d "/proc/$pid" ]; then
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || return 1
+  else
+    command -v lsof >/dev/null 2>&1 || return 1
+    cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+  fi
+  [ -n "$cwd" ] || return 1
+  printf '%s' "$cwd"
+}
+
+# fm_busy_kiro_task_worktree: this task's recorded worktree, physically resolved
+# so it compares equal to a kernel-reported cwd (/tmp vs /private/tmp on macOS).
+fm_busy_kiro_task_worktree() {  # <state-dir> <id>
+  local wt
+  wt=$(LC_ALL=C awk -F= '$1 == "worktree" { sub(/^[^=]*=/, ""); print; exit }' "$1/$2.meta" 2>/dev/null)
+  [ -n "$wt" ] && [ -d "$wt" ] || return 1
+  (cd "$wt" 2>/dev/null && pwd -P)
+}
+
+# fm_busy_kiro_turn_state: busy | settled | none for one worktree.
+#   busy     a marker names a live process whose cwd is <worktree>
+#   settled  the marker directory exists and no marker is bound to <worktree>
+#   none     the marker directory is absent or unreadable
+fm_busy_kiro_turn_state() {  # <worktree> [marker-dir]
+  local want=$1 dir=${2-} marker base pid cwd
+  [ -n "$dir" ] || dir=$(fm_busy_kiro_marker_dir)
+  [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] || { printf 'none'; return 0; }
+  for marker in "$dir"/*.json; do
+    [ -f "$marker" ] || continue
+    base=${marker##*/}
+    pid=${base%%-*}
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    cwd=$(fm_busy_pid_cwd "$pid") || continue
+    cwd=$(cd "$cwd" 2>/dev/null && pwd -P) || continue
+    if [ "$cwd" = "$want" ]; then
+      printf 'busy'
+      return 0
+    fi
+  done
+  printf 'settled'
+}
+
+# fm_busy_kiro_composer_idle: 0 when the LAST composer row (`›`) in the captured
+# screen on stdin is Kiro's empty placeholder (verified live on kiro-cli 2.27.1:
+# `›  ask a question or describe a task ↵`; a running turn renders
+# `›  Kiro is working · ...` and startup `›  Initializing · ...` on that row).
+# The last row is the live composer: earlier rows can only be scrollback.
+# FM_BUSY_KIRO_IDLE_REGEX overrides the placeholder signature.
+fm_busy_kiro_composer_idle() {
+  local row
+  row=$(grep -E '^[[:space:]]*›' | tail -1)
+  [ -n "$row" ] || return 1
+  printf '%s\n' "$row" \
+    | grep -qE "${FM_BUSY_KIRO_IDLE_REGEX:-^[[:space:]]*›[[:space:]]+ask a question or describe a task( ↵)?[[:space:]]*\$}"
+}
+
 # --- launch-prompt signatures (fm_busy_launch_prompt_parked) ----------------
 #
 # Each function consumes a captured pane tail on stdin (the caller's whole
@@ -1019,7 +1124,7 @@ fm_busy_launch_prompt_parked() {  # <harness>
 # at the fm-spawn seed keeps reading busy fm-spawn, unchanged.
 fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 tail40=${6-}
-  local out rc r_state r_source native log
+  local out rc r_state r_source native log wt screen
   case "$harness" in
     kimi*)
       if ! fm_busy_kimi_verified; then
@@ -1049,6 +1154,36 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
         settled) printf 'idle cursor-transcript' ;;
         *) printf 'unknown cursor-transcript' ;;
       esac
+      return 0
+      ;;
+    kiro)
+      # Pull source, on demand (see "kiro turn-marker busy source" above). A
+      # bound marker is busy on its own; idle needs the settled marker set AND
+      # the live composer placeholder, so startup and unreadable state stay
+      # unknown. The screen is read whole, because a fresh session renders its
+      # composer mid-pane with blank rows below that a short tail would miss.
+      if ! wt=$(fm_busy_kiro_task_worktree "$state" "$id"); then
+        printf 'unknown kiro-turn-marker'
+        return 0
+      fi
+      case "$(fm_busy_kiro_turn_state "$wt")" in
+        busy) printf 'busy kiro-turn-marker'; return 0 ;;
+        settled) ;;
+        *) printf 'unknown kiro-turn-marker'; return 0 ;;
+      esac
+      screen=
+      if command -v fm_backend_visible_capture_supported >/dev/null 2>&1 \
+        && fm_backend_visible_capture_supported "$backend"; then
+        screen=$(fm_backend_visible_capture "$backend" "$target" 2>/dev/null) || screen=
+      elif command -v fm_backend_capture >/dev/null 2>&1; then
+        screen=$(fm_backend_capture "$backend" "$target" 200 2>/dev/null) || screen=
+      fi
+      [ -n "$screen" ] || screen=$tail40
+      if [ -n "$screen" ] && printf '%s\n' "$screen" | fm_busy_kiro_composer_idle; then
+        printf 'idle kiro-turn-marker'
+      else
+        printf 'unknown kiro-turn-marker'
+      fi
       return 0
       ;;
   esac

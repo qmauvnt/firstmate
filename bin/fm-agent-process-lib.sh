@@ -51,6 +51,10 @@ fm_agent_process_classify_name() {  # <path> [argv0] -> agent|shell|other
     # way (verified, devin 3000.11.1: comm=devin), so a `*devin*` glob never
     # claims an unrelated command.
     agy|devin) printf 'agent' ;;
+    # kiro is anchored on its two exact CLI names (verified, kiro-cli 2.27.1:
+    # tmux reports the pane command as kiro-cli, and kiro-cli-chat is the
+    # process it execs), never *kiro*, which would claim the Kiro desktop app.
+    kiro-cli|kiro-cli-chat) printf 'agent' ;;
     zsh|bash|sh|dash|ash|ksh|mksh|tcsh|csh|fish) printf 'shell' ;;
     *)
       if fm_harness_path_name "$path" >/dev/null || fm_harness_path_name "$argv0" >/dev/null; then
